@@ -1,0 +1,355 @@
+#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const net = require('node:net');
+
+const VERSION = 'termux-run 1.0.0';
+// What the bridge's hello promises: from 3 on it hands our fd 0 to the
+// command itself, from 4 on it waits for us when we fall behind on output.
+const STDIN_BRIDGE = 3;
+const PACED_BRIDGE = 4;
+// Output held for a reader that is behind, per stream, before the command is
+// made to wait for it.
+const BACKLOG = 16 << 20;
+// Where the bridge keeps its socket and token, as seen from in here: a
+// directory bound to the first path on purpose, else the host's own path,
+// which a default proot-distro login passes through.
+const RUN_DIRS = [
+  '/run/termux-bridge',
+  '/data/data/com.termux/files/home/.local/lib/termux-proot-bridge/run',
+];
+const START_HINT = 'run `termux-proot-bridge start` in Termux, outside the container';
+const USAGE = `Usage: termux-run [options] command [args...]
+       termux-run [options] -c 'string' [args...]
+       termux-run --status
+
+Run a command on the Termux host, outside the PRoot container, and bring
+back its output and exit status. Commands run as the Termux user; --root
+runs them through su.
+
+Options:
+  -C, --cwd PATH        working directory; has to be inside a directory that
+                        is shared with the host (default: current directory)
+  -t, --timeout SECS    time limit, 1..3600 (default: 600)
+  -n, --no-stdin        do not hand standard input to the command
+      --root            run as root (su -c)
+  -M, --mount-master    pass -M to su; only with --root
+  -c STRING             run STRING with bash -c on the host
+      --status          check that the bridge can be reached
+  -h, --help            show this help
+      --version         show the version
+
+A pipe or a regular file on standard input is read by the host command
+itself; input it does not read stays with the caller. A terminal, /dev/null
+or a socket is not handed over, and the command reads /dev/null instead;
+"cat | termux-run ..." turns a socket into a pipe.
+
+Exit status: 124 timed out, 125 bridge or request error, 126 not executable,
+127 command not found, 128+N ended by signal N.
+
+TERMUX_RUN_DIR sets the bridge's run directory, as a path in the container.
+`;
+
+const strict = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
+
+// Bytes that are not UTF-8 become lone surrogates U+DC80..U+DCFF, which the
+// bridge turns back into the bytes (Python's surrogateescape).
+function escapeBytes(bytes) {
+  try {
+    return strict.decode(bytes);
+  } catch {
+    // Taken apart below.
+  }
+  let text = '';
+  for (let i = 0; i < bytes.length;) {
+    const lead = bytes[i];
+    const size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+    try {
+      text += strict.decode(bytes.subarray(i, i + size));
+      i += size;
+    } catch {
+      text += String.fromCharCode(0xdc00 + lead);
+      i++;
+    }
+  }
+  return text;
+}
+
+// Node decodes the arguments as UTF-8 and replaces what is not. The kernel
+// still has the bytes.
+function rawArguments(count) {
+  let raw;
+  try {
+    raw = fs.readFileSync('/proc/self/cmdline');
+  } catch {
+    return null;
+  }
+  const parts = [];
+  for (let start = 0, end; (end = raw.indexOf(0, start)) >= 0; start = end + 1) {
+    parts.push(raw.subarray(start, end));
+  }
+  return parts.length < count ? null : parts.slice(parts.length - count).map(escapeBytes);
+}
+
+let args = process.argv.slice(2);
+if (args.some(arg => arg.includes('\ufffd'))) args = rawArguments(args.length) || args;
+let cwd = process.cwd();
+let timeout = 600;
+let useStdin = true;
+let useRoot = false;
+let mountMaster = false;
+let statusOnly = false;
+let commandString = null;
+let command = null;
+
+function usageError(message) {
+  process.stderr.write(`termux-run: ${message}\n`);
+  process.stderr.write(USAGE);
+  process.exit(2);
+}
+
+function optionValue(flag, value) {
+  if (value === undefined || value === null || value === '') {
+    usageError(`${flag} needs a value`);
+  }
+  return value;
+}
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === '--') { command = args.slice(i + 1); break; }
+  if (arg === '-h' || arg === '--help') { process.stdout.write(USAGE); process.exit(0); }
+  if (arg === '--version') { process.stdout.write(VERSION + '\n'); process.exit(0); }
+  if (arg === '--status') { statusOnly = true; continue; }
+  if (arg === '-n' || arg === '--no-stdin') { useStdin = false; continue; }
+  if (arg === '--root') { useRoot = true; continue; }
+  if (arg === '-M' || arg === '--mount-master') { mountMaster = true; continue; }
+  let flag = arg;
+  let value;
+  const equals = arg.indexOf('=');
+  if (arg.startsWith('--') && equals > 0) {
+    flag = arg.slice(0, equals);
+    value = arg.slice(equals + 1);
+  } else if (['-C', '--cwd', '-t', '--timeout', '-c'].includes(arg)) {
+    value = args[++i];
+  } else if (!arg.startsWith('-') || arg === '-') {
+    command = args.slice(i);
+    break;
+  } else {
+    usageError(`Unknown option: ${arg}`);
+  }
+  value = optionValue(flag, value);
+  if (flag === '-C' || flag === '--cwd') cwd = value;
+  else if (flag === '-t' || flag === '--timeout') timeout = Number(value);
+  else if (flag === '-c') commandString = value;
+  else usageError(`Unknown option: ${arg}`);
+}
+
+if (commandString !== null) {
+  command = ['bash', '-c', commandString, ...(command || [])];
+}
+if (statusOnly) {
+  if (command && command.length) usageError('--status takes no command');
+  timeout = 5;
+} else {
+  if (!command || command.length === 0) usageError('No command given');
+  if (mountMaster && !useRoot) usageError('-M/--mount-master only works with --root');
+  if (!Number.isFinite(timeout) || timeout < 1 || timeout > 3600) {
+    usageError('--timeout must be a number of seconds from 1 to 3600');
+  }
+  try {
+    cwd = fs.realpathSync(cwd);
+  } catch {
+    process.stderr.write(`termux-run: Working directory does not exist or cannot be entered: ${cwd}\n`);
+    process.exit(125);
+  }
+}
+
+// su takes one command string, and some implementations refuse one that is
+// not UTF-8. Bytes that are not go in as octal escapes inside $'...'.
+function shellQuote(value) {
+  if (!/[\udc80-\udcff]/u.test(value)) return "'" + value.replace(/'/g, "'\\''") + "'";
+  let text = "$'";
+  for (const char of value) {
+    const code = char.codePointAt(0);
+    if (code >= 0xdc80 && code <= 0xdcff) text += '\\' + (code - 0xdc00).toString(8);
+    else if (char === "'" || char === '\\') text += '\\' + char;
+    else text += char;
+  }
+  return text + "'";
+}
+
+if (useRoot && !statusOnly) {
+  // su only takes one command string and starts /system/bin/sh with the
+  // system PATH; Termux tools are appended so system am/pm/ps keep priority.
+  const script = 'PATH=$PATH:${PREFIX:-/data/data/com.termux/files/usr}/bin; '
+    + 'exec ' + command.map(shellQuote).join(' ');
+  command = ['su', ...(mountMaster ? ['-M'] : []), '-c', script];
+}
+
+// Only a pipe or a regular file is input somebody meant for the command.
+// The bridge opens it by itself, so this process never reads fd 0.
+let attachStdin = false;
+if (useStdin && !statusOnly) {
+  try {
+    const stat = fs.fstatSync(0);
+    attachStdin = stat.isFIFO() || stat.isFile();
+  } catch {
+    attachStdin = false;
+  }
+}
+
+function sharedOutput() {
+  try {
+    const out = fs.fstatSync(1, {bigint: true});
+    const err = fs.fstatSync(2, {bigint: true});
+    return out.dev === err.dev && out.ino === err.ino;
+  } catch {
+    return false;
+  }
+}
+
+let runDir = process.env.TERMUX_RUN_DIR || '';
+let token = null;
+for (const dir of runDir ? [runDir] : RUN_DIRS) {
+  try {
+    token = fs.readFileSync(dir + '/token', 'utf8').trim();
+    runDir = dir;
+    break;
+  } catch {
+    // Not there; the next one may be.
+  }
+}
+if (token === null) {
+  const where = runDir || RUN_DIRS.join(', ');
+  process.stderr.write(`termux-run: No bridge found (no readable token in ${where}); ${START_HINT}\n`);
+  process.exit(125);
+}
+
+const socket = net.connect(runDir + '/bridge.sock');
+let pending = '';
+let done = false;
+let sent = false;
+let bridgeVersion = 1;
+const congested = new Set();
+
+const timer = setTimeout(
+  () => abort(124, `No result from the bridge within ${timeout + 15} seconds`),
+  (timeout + 15) * 1000);
+
+function abort(code, message) {
+  if (done) return;
+  done = true;
+  clearTimeout(timer);
+  if (message) process.stderr.write(`termux-run: ${message}\n`);
+  process.exitCode = code;
+  if (!socket.destroyed) socket.destroy();
+}
+
+function finish(code) {
+  if (done) return;
+  done = true;
+  clearTimeout(timer);
+  process.exitCode = code;
+  if (!socket.destroyed) socket.end();
+}
+
+function onPipeError(error) {
+  if (!error || error.code !== 'EPIPE') return;
+  done = true;
+  clearTimeout(timer);
+  if (!socket.destroyed) socket.destroy();
+  process.exit(141);
+}
+
+process.stdout.on('error', onPipeError);
+process.stderr.on('error', onPipeError);
+
+// A reader that is behind gets BACKLOG of output held for it in here. Past
+// that nothing more is read from the socket until it caught up, which leaves
+// the rest in the bridge and so in the command. Older bridges hang up on a
+// client that stops reading, so there it all piles up in here as before.
+function emit(stream, chunk) {
+  if (stream.write(chunk) || bridgeVersion < PACED_BRIDGE) return;
+  if (stream.writableLength < BACKLOG || congested.has(stream)) return;
+  if (congested.size === 0) socket.pause();
+  congested.add(stream);
+  stream.once('drain', () => {
+    congested.delete(stream);
+    if (congested.size === 0) socket.resume();
+  });
+}
+
+// Sent once the bridge said hello: at its connection limit the first line is
+// an error instead, and a request written into that would hide it.
+function sendRequest() {
+  sent = true;
+  if (attachStdin && bridgeVersion < STDIN_BRIDGE) {
+    process.stderr.write('termux-run: The running bridge is too old to attach standard input; restart it\n');
+  }
+  const request = {version: 1, token, cwd, argv: command, timeout};
+  if (attachStdin) request.attach_stdin = true;
+  if (sharedOutput()) request.merge = true;
+  const line = JSON.stringify(request) + '\n';
+  if (Buffer.byteLength(line) > (1 << 20)) {
+    abort(125, 'Request too large (limit 1 MiB)');
+    return;
+  }
+  socket.write(line);
+}
+
+socket.on('data', data => {
+  pending += data.toString();
+  let index;
+  while ((index = pending.indexOf('\n')) >= 0) {
+    const line = pending.slice(0, index);
+    pending = pending.slice(index + 1);
+    if (!line) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      abort(125, 'The bridge sent a response that cannot be parsed');
+      return;
+    }
+    if (Number.isInteger(message.hello)) {
+      bridgeVersion = message.hello;
+      if (statusOnly) {
+        process.stdout.write(`Bridge available: revision ${bridgeVersion}, run directory ${runDir}\n`);
+        finish(0);
+        return;
+      }
+      if (!sent) sendRequest();
+      continue;
+    }
+    if (message.stdout) emit(process.stdout, Buffer.from(message.stdout, 'base64'));
+    if (message.stderr) emit(process.stderr, Buffer.from(message.stderr, 'base64'));
+    if (message.error) {
+      abort(Number.isInteger(message.exit) ? message.exit : 125, message.error);
+      return;
+    }
+    if (Number.isInteger(message.exit)) {
+      if (message.background) {
+        process.stderr.write('termux-run: The command exited, but background processes still hold its output; not waiting for them, and those in its process group are killed\n');
+      }
+      finish(message.exit < 0 ? 128 - message.exit : message.exit);
+      return;
+    }
+  }
+});
+
+socket.on('error', error => {
+  const stale = error.code === 'ECONNREFUSED' || error.code === 'ENOENT';
+  abort(125, stale ? `The bridge is not running; ${START_HINT}` : `Cannot connect to the bridge (${error.code || error.message})`);
+});
+socket.on('close', () => {
+  if (!done) abort(125, 'The bridge closed the connection');
+});
+
+for (const [signal, number] of [['SIGINT', 2], ['SIGTERM', 15]]) {
+  process.on(signal, () => {
+    // Before the request went out there is no command to pass it on to.
+    if (!sent) abort(128 + number);
+    else if (!socket.destroyed) socket.write(JSON.stringify({signal}) + '\n');
+  });
+}
